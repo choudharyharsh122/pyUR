@@ -1,0 +1,10 @@
+## from this PC to other
+
+rostopic pub -r 2 /mpc/link_test std_msgs/String 'data: "from PyUR"'
+timeout -k 2s 10s rostopic echo -n 1 /mpc/link_test
+
+
+## from other PC to this
+
+rostopic pub -r 2 /mpc/link_test_return std_msgs/String 'data: "from listener"'
+timeout -k 2s 10s rostopic echo -n 1 /mpc/link_test_return

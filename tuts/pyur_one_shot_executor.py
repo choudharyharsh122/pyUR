@@ -2,6 +2,7 @@
 """Run one remote velocity pulse against the PyUR simulation."""
 
 import math
+from queue import Empty, Queue
 import time
 
 import rospy
@@ -15,7 +16,7 @@ POSITION_CONTROLLER = "scaled_pos_joint_traj_controller"
 VELOCITY_CONTROLLER = "joint_group_vel_controller"
 SWITCH_SERVICE = "/robot/controller_manager/switch_controller"
 VELOCITY_TOPIC = "/joint_group_vel_controller/command"
-JOINTS_PARAM = "/robot/ur_hardware_interface/joints"
+JOINTS_PARAM = f"/robot/{VELOCITY_CONTROLLER}/joints"
 PULSE_SECONDS = 0.25
 MAX_SPEED = 0.05
 
@@ -47,7 +48,17 @@ def tcp_position(buffer, base, tool):
 
 def main():
     rospy.init_node("pyur_one_shot_executor")
-    joint_names = rospy.get_param(JOINTS_PARAM)
+    try:
+        rospy.wait_for_service(SWITCH_SERVICE, timeout=5)
+    except rospy.ROSException as error:
+        raise RuntimeError(
+            "PyUR's controller manager is unavailable on the current ROS master. "
+            "Source ros_talker_ipconfig.sh in both terminals and start "
+            "'roslaunch bullet_ros_ur simulation.launch' before rerunning the executor."
+        ) from error
+    joint_names = rospy.get_param(JOINTS_PARAM, [])
+    if not joint_names:
+        raise RuntimeError(f"Missing velocity controller joint configuration at {JOINTS_PARAM}")
     base = rospy.get_param("~base_frame", "base_link")
     tool = rospy.get_param("~tool_frame", "tool0")
     tf_buffer = tf2_ros.Buffer()
@@ -57,15 +68,37 @@ def main():
         "/mpc/test_observation", JointState, queue_size=1, latch=True
     )
     velocity = rospy.Publisher(VELOCITY_TOPIC, Float64MultiArray, latch=True, queue_size=1)
-    wait_for_subscriber(observations)
     observation = rospy.wait_for_message("/joint_states", JointState, timeout=5)
     if observation.header.stamp == rospy.Time(0):
         raise ValueError("PyUR returned an unstamped joint observation")
-    observations.publish(observation)
-    reply = rospy.wait_for_message("/mpc/test_command", JointTrajectory, timeout=5)
+    replies = Queue()
+    command_subscriber = rospy.Subscriber(
+        "/mpc/test_command", JointTrajectory, replies.put, queue_size=1
+    )
+    try:
+        deadline = time.monotonic() + 15
+        saw_observation_subscriber = False
+        rospy.loginfo("Sending one joint sample; retrying delivery until a matching reply arrives.")
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            observations.publish(observation)
+            saw_observation_subscriber |= observations.get_num_connections() > 0
+            try:
+                reply = replies.get(timeout=0.5)
+            except Empty:
+                continue
+            if reply.header.stamp == observation.header.stamp:
+                break
+        else:
+            raise RuntimeError(
+                "No matching command on /mpc/test_command. Observation TCPROS "
+                f"subscriber connected during this run: {saw_observation_subscriber}."
+            )
+    finally:
+        command_subscriber.unregister()
+        observations.unregister()
 
-    if reply.header.stamp != observation.header.stamp or len(reply.points) != 1:
-        raise ValueError("Expected one command point matching the observation timestamp")
+    if len(reply.points) != 1:
+        raise ValueError("Expected one command point")
     speeds = reply.points[0].velocities
     if len(speeds) != len(joint_names) or sorted(reply.joint_names) != sorted(joint_names):
         raise ValueError("Expected one velocity for each configured arm joint")
@@ -75,7 +108,6 @@ def main():
     command = Float64MultiArray(data=[by_name[name] for name in joint_names])
     rospy.loginfo("Accepted joint velocities in rad/s: %s", by_name)
 
-    rospy.wait_for_service(SWITCH_SERVICE, timeout=5)
     switch = rospy.ServiceProxy(SWITCH_SERVICE, SwitchController)
     before = tcp_position(tf_buffer, base, tool)
     switch_controller(switch, VELOCITY_CONTROLLER, POSITION_CONTROLLER)
