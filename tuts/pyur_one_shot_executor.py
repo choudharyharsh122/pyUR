@@ -17,7 +17,7 @@ VELOCITY_CONTROLLER = "joint_group_vel_controller"
 SWITCH_SERVICE = "/robot/controller_manager/switch_controller"
 VELOCITY_TOPIC = "/joint_group_vel_controller/command"
 JOINTS_PARAM = f"/robot/{VELOCITY_CONTROLLER}/joints"
-PULSE_SECONDS = 0.25
+PULSE_SECONDS = 3.0
 MAX_SPEED = 0.05
 
 

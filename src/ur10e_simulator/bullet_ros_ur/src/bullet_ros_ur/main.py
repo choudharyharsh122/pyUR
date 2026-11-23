@@ -7,14 +7,17 @@ from bullet_ros_ur.msg import bullet_to_ros, AirskinStatus, Collisions, ros_to_b
 import numpy as np
 from controller_manager_msgs.srv import ListControllers
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Header, String, Bool
+from std_msgs.msg import Header, String, Bool, Float32
 from bullet_ros_ur.srv import grip, gripResponse, changeObjPose, changeObjPoseResponse, activateAirskin, activateAirskinResponse
 import tf.transformations as ts
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point, Quaternion, WrenchStamped
+from geometry_msgs.msg import Point, Pose, PoseArray, Quaternion, WrenchStamped
 import os
 import sys
 from std_srvs.srv import SetBool, SetBoolResponse
+
+
+CONTACT_ARROW_METRES_PER_NEWTON = 0.004
 
 
 class BulletROS:
@@ -98,6 +101,20 @@ class BulletROS:
         self.pub = rospy.Publisher("/bullet_ros/read", bullet_to_ros, queue_size=1)
 
         self.collisions_pub = rospy.Publisher("/bullet_ros/collisions", Collisions, queue_size=1)
+        self.mission_fingers_pub = None
+        self.mission_contacts_pub = None
+        if getattr(self.client.config, "rg6_hold_mission_block", False):
+            self.mission_finger_ids = [self.client.get_link_id(name) for name in
+                                       ("left_inner_finger", "right_inner_finger")]
+            self.mission_fingers_pub = rospy.Publisher("/bullet_ros/mission_fingers", PoseArray, queue_size=1)
+            self.mission_contacts_pub = rospy.Publisher("/bullet_ros/mission_contacts", MarkerArray, queue_size=1)
+            self.mission_block_id = next(obj_id for obj_id, name, *_ in self.client.other_objects
+                                         if name == "mission_block")
+            self.mission_destination_id = min(
+                (obj_id for obj_id, name, *_ in self.client.other_objects if name == "mission_support"),
+                key=lambda obj_id: self.client.getBasePositionAndOrientation(obj_id)[0][0],
+            )
+            self.mission_support_pub = rospy.Publisher("/bullet_ros/mission_destination_load", Float32, queue_size=1)
         self.other_objects_joints = rospy.Publisher("/bullet_ros/other_objects", OtherObjects, queue_size=1)
 
         self.wrench_pub = rospy.Publisher("/robot/wrench", WrenchStamped, queue_size=1)
@@ -289,6 +306,16 @@ class BulletROS:
             self.last_skin_time = rospy.get_time()
         self.publish_other_objects()
         self.publish_collision_forces()
+        if self.mission_fingers_pub is not None:
+            poses = PoseArray(header=Header(stamp=rospy.Time.now(), frame_id="base_link"))
+            for link_id in self.mission_finger_ids:
+                state = self.client.getLinkState(self.client.robot, link_id)
+                poses.poses.append(Pose(Point(*state[self.client.linkInfo["URDFPOS"]]),
+                                        Quaternion(*state[self.client.linkInfo["URDFORI"]])))
+            self.mission_fingers_pub.publish(poses)
+            support_contacts = self.client.getContactPoints(self.mission_block_id, self.mission_destination_id)
+            self.mission_support_pub.publish(Float32(sum(hit[self.client.contactPoints["FORCE"]]
+                                                          for hit in support_contacts)))
         self.publish_wrench()
         #self.publish_grip_status()
         self.pub.publish(self.msg)
@@ -329,20 +356,56 @@ class BulletROS:
 
     def publish_collision_forces(self):
         msg = Collisions()
+        show_contacts = self.mission_contacts_pub is not None and self.mission_contacts_pub.get_num_connections()
+        markers = MarkerArray()
+        contact_fields = self.client.contactPoints
+        header = Header(stamp=rospy.Time.now(), frame_id="base_link") if show_contacts else None
         for obj_id, obj_name, _, _, _ in self.client.other_objects:
             collisions = self.client.getContactPoints(self.client.robot, obj_id)
-            for contact in collisions:
-                force = contact[self.client.contactPoints["FORCE"]]
+            for contact_id, contact in enumerate(collisions):
+                force = contact[contact_fields["FORCE"]]
                 if force != 0:
                     msg.forces.append(force)
                     msg.obj_names.append(obj_name)
                     for link in self.client.links:
-                        if link.robot_link_id == contact[self.client.contactPoints["INDEXA"]]:
+                        if link.robot_link_id == contact[contact_fields["INDEXA"]]:
                             msg.robot_links.append(link.name)
                             break
-                    msg.distances.append(contact[self.client.contactPoints["DISTANCE"]])
+                    msg.distances.append(contact[contact_fields["DISTANCE"]])
+                    if show_contacts and obj_name == "mission_block":
+                        finger_id = contact[contact_fields["INDEXA"]]
+                        if finger_id in self.mission_finger_ids:
+                            side = ("left", "right")[self.mission_finger_ids.index(finger_id)]
+                            markers.markers.extend(self.mission_contact_arrows(header, side, contact_id, contact))
         if len(msg.forces) > 0:
             self.collisions_pub.publish(msg)
+        if show_contacts:
+            self.mission_contacts_pub.publish(markers)
+
+    def mission_contact_arrows(self, header, side, contact_id, contact):
+        fields = self.client.contactPoints
+        origin = np.asarray(contact[fields["POSITIONB"]])
+        # The reported normal points from body B (cube) to body A (finger).
+        normal = -contact[fields["FORCE"]] * np.asarray(contact[fields["NORMAL"]])
+        # For this PyBullet contact query, signed lateral terms give the force on B.
+        tangent = sum(contact[fields[f"FRICTION{i}"]] * np.asarray(contact[fields[f"FRICTIONDIR{i}"]])
+                      for i in (1, 2))
+        for name, vector, rgb in (("normal", normal, (0.2, 0.7, 1.0)),
+                                  ("friction", tangent, (1.0, 0.7, 0.1))):
+            magnitude = np.linalg.norm(vector)
+            if magnitude < 1e-6:
+                continue
+            endpoint = origin + CONTACT_ARROW_METRES_PER_NEWTON * vector
+            arrow = Marker(header=header, ns=f"{side}_{name}", id=contact_id,
+                           type=Marker.ARROW, action=Marker.ADD, lifetime=rospy.Duration(0.15))
+            arrow.pose.orientation.w = 1.0
+            arrow.points = [Point(*origin), Point(*endpoint)]
+            arrow.scale.x = 0.0015
+            arrow.scale.y = 0.003
+            arrow.scale.z = min(0.004, 0.4 * CONTACT_ARROW_METRES_PER_NEWTON * magnitude)
+            arrow.color.r, arrow.color.g, arrow.color.b = rgb
+            arrow.color.a = 1.0
+            yield arrow
 
     def publish_other_objects(self):
         """
@@ -551,23 +614,46 @@ class BulletROS:
         else:
             closing = True
 
+        mission_block = None
+        if closing and getattr(self.client.config, "rg6_hold_mission_block", False):
+            mission_block = next((obj_id for obj_id, name, _, _, _ in self.client.other_objects
+                                  if name == "mission_block"), None)
+            if mission_block is not None:
+                self.client.setJointMotorControl2(
+                    self.client.robot, self.client.gripper.finger_joint_id,
+                    self.client.POSITION_CONTROL,
+                    targetPosition=self.client.gripper.joint_ref.set_point,
+                    force=self.client.gripper.max_force, maxVelocity=velocity,
+                )
+
         num_refs = 8
         last_refs = -99*np.ones(num_refs)
         ref_id = 0
+        grip_deadline = time.monotonic() + 12.0
         # wait until the gripper is closed
         while not rospy.is_shutdown():
+            if mission_block is not None and time.monotonic() >= grip_deadline:
+                self.client.stop_robot([self.client.gripper.control_joint_name])
+                rospy.logwarn("Timed out closing the RG6 on the mission block")
+                return gripResponse(success=False)
 
             if closing:
                 touch_counter = 0
                 for f_link_id in self.client.gripper.finger_links_ids:
-                    cp = self.client.getContactPoints(bodyA=self.client.robot, linkIndexA=f_link_id)
+                    bodies = {"bodyA": self.client.robot, "linkIndexA": f_link_id}
+                    if mission_block is not None:
+                        bodies["bodyB"] = mission_block
+                    cp = self.client.getContactPoints(**bodies)
                     for c in cp:
                         if c[self.client.contactPoints["FORCE"]] > 2.5:
                             touch_counter += 1
                             break
                 if touch_counter >= 2:
-                    rospy.logwarn("Gripper touched the object, stopping it")
-                    self.client.stop_robot([self.client.gripper.control_joint_name])
+                    if mission_block is None:
+                        rospy.logwarn("Gripper touched the object, stopping it")
+                        self.client.stop_robot([self.client.gripper.control_joint_name])
+                    else:
+                        rospy.loginfo("RG6 holding the mission block under motor force")
                     break
 
             info = self.client.getJointState(self.client.robot, self.client.gripper.finger_joint_id)
@@ -578,7 +664,8 @@ class BulletROS:
             if np.abs(info[self.client.jointStates["POSITION"]] - self.client.gripper.joint_ref.set_point) <= self.client.joint_tolerance:
                 self.client.stop_robot([self.client.gripper.control_joint_name])
                 break
-            if last_refs[0] != -99 and np.allclose(last_refs, info[self.client.jointStates["POSITION"]], atol=0.001):
+            if (mission_block is None and last_refs[0] != -99
+                    and np.allclose(last_refs, info[self.client.jointStates["POSITION"]], atol=0.001)):
                 rospy.logwarn("Gripper is not moving, stopping it")
                 self.client.stop_robot([self.client.gripper.control_joint_name])
                 break

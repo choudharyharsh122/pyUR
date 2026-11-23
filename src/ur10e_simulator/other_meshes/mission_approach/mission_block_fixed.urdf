@@ -1,0 +1,25 @@
+<robot name="mission_block">
+<link name="mission_block">
+    <inertial>
+        <mass value="0.08"/>
+        <inertia ixx="3.333333333e-05" ixy="0.0" ixz="0.0" iyy="3.333333333e-05" iyz="0.0" izz="3.333333333e-05"/>
+    </inertial>
+    <visual>
+        <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+        <geometry>
+            <mesh filename="package://other_meshes/mission_approach/mission_block.obj"/>
+        </geometry>
+        <material name="mission_block_color">
+            <color rgba="0.8 0.1 0.1 1.0"/>
+        </material>
+    </visual>
+    <collision>
+        <geometry>
+            <mesh filename="/home/docker/data/src/ur10e_simulator/other_meshes/mission_approach/meshes/fixed_urdf/collision/mission_block.obj"/>
+        </geometry>
+    </collision>
+    <contact>
+        <lateral_friction value="1.5"/>
+    </contact>
+</link>
+</robot>

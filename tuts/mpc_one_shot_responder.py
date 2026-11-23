@@ -7,6 +7,8 @@ import rospy
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+SHOULDER_SPEED = 0.05  # rad/s
+
 ARM_JOINTS = [
     "shoulder_pan_joint",
     "shoulder_lift_joint",
@@ -36,9 +38,9 @@ def main():
     reply = JointTrajectory()
     reply.header.stamp = observation.header.stamp
     reply.joint_names = ARM_JOINTS
-    reply.points = [JointTrajectoryPoint(velocities=[0.04, 0.0, 0.0, 0.0, 0.0, 0.0])]
+    reply.points = [JointTrajectoryPoint(velocities=[SHOULDER_SPEED, 0.0, 0.0, 0.0, 0.0, 0.0])]
     commands.publish(reply)
-    rospy.loginfo("Sent one shoulder_pan_joint velocity command at 0.04 rad/s")
+    rospy.loginfo("Sent one shoulder_pan_joint velocity command at %.2f rad/s", SHOULDER_SPEED)
     while not rospy.is_shutdown() and commands.get_num_connections() and time.monotonic() < deadline:
         time.sleep(0.02)
 

@@ -1,0 +1,40 @@
+# One-block fixture shared with mission_mujoco/tests/run_pyur_approach.py.
+vhacd:
+  use_vhacd: true
+  force_vhacd: false
+  force_vhacd_urdf: true
+robot_urdf_path: "../../../UR10e_meshes/ur10e_rg6.urdf"
+gui: false
+tolerance:
+  joint: 1e-3
+end_effector: onrobot_rg6_base_link
+# Nominal MuJoCo mission starting configuration, in degrees.
+initial_joint_angles:
+  shoulder_pan_joint: -245.232328
+  shoulder_lift_joint: -89.132025
+  elbow_joint: 82.992309
+  wrist_1_joint: -83.860283
+  wrist_2_joint: -90.0
+  wrist_3_joint: -155.232328
+show_collision: false
+urdfs:
+  paths:
+    - mission_approach/mission_support.urdf
+    - mission_approach/mission_support.urdf
+    - mission_approach/mission_block.urdf
+  # PyUR base_link is rotated 180 degrees about Z from the MuJoCo world.
+  # These are the transformed centers of p0, p1, and the block at p0c0.
+  positions: [[-0.50, 0.36, 0.28], [-0.80, 0.0, 0.28], [-0.39, 0.42, 0.345]]
+  fixed: [true, true, false]
+  color: [[0.55, 0.45, 0.32], [0.55, 0.45, 0.32], [0.8, 0.1, 0.1]]
+skin:
+  use: false
+  period: 30
+collision_tolerance: 0.001
+debug: false
+log:
+  log: false
+  period: 0.01
+simulation_step: 240
+self_collisions: true
+rg6_hold_mission_block: true
