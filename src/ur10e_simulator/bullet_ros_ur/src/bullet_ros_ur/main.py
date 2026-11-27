@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import time
 
 import rospy
@@ -103,6 +104,7 @@ class BulletROS:
         self.collisions_pub = rospy.Publisher("/bullet_ros/collisions", Collisions, queue_size=1)
         self.mission_fingers_pub = None
         self.mission_contacts_pub = None
+        self.mission_blocks_pub = None
         if getattr(self.client.config, "rg6_hold_mission_block", False):
             self.mission_finger_ids = [self.client.get_link_id(name) for name in
                                        ("left_inner_finger", "right_inner_finger")]
@@ -110,6 +112,12 @@ class BulletROS:
             self.mission_contacts_pub = rospy.Publisher("/bullet_ros/mission_contacts", MarkerArray, queue_size=1)
             self.mission_block_id = next(obj_id for obj_id, name, *_ in self.client.other_objects
                                          if name == "mission_block")
+            self.mission_blocks = {
+                name: obj_id for obj_id, name, *_ in self.client.other_objects
+                if name == "mission_block" or name.startswith("mission_block_")
+            }
+            if len(self.mission_blocks) > 1:
+                self.mission_blocks_pub = rospy.Publisher("/bullet_ros/mission_blocks", String, queue_size=1)
             self.mission_destination_id = min(
                 (obj_id for obj_id, name, *_ in self.client.other_objects if name == "mission_support"),
                 key=lambda obj_id: self.client.getBasePositionAndOrientation(obj_id)[0][0],
@@ -316,6 +324,17 @@ class BulletROS:
             support_contacts = self.client.getContactPoints(self.mission_block_id, self.mission_destination_id)
             self.mission_support_pub.publish(Float32(sum(hit[self.client.contactPoints["FORCE"]]
                                                           for hit in support_contacts)))
+            if self.mission_blocks_pub is not None:
+                blocks = {}
+                for name, body in self.mission_blocks.items():
+                    position, orientation = self.client.getBasePositionAndOrientation(body)
+                    contacts = self.client.getContactPoints(body, self.mission_destination_id)
+                    blocks[name] = {
+                        "position": position,
+                        "orientation": orientation,
+                        "destination_load": sum(hit[self.client.contactPoints["FORCE"]] for hit in contacts),
+                    }
+                self.mission_blocks_pub.publish(String(data=json.dumps(blocks)))
         self.publish_wrench()
         #self.publish_grip_status()
         self.pub.publish(self.msg)
@@ -372,7 +391,7 @@ class BulletROS:
                             msg.robot_links.append(link.name)
                             break
                     msg.distances.append(contact[contact_fields["DISTANCE"]])
-                    if show_contacts and obj_name == "mission_block":
+                    if show_contacts and obj_name in self.mission_blocks:
                         finger_id = contact[contact_fields["INDEXA"]]
                         if finger_id in self.mission_finger_ids:
                             side = ("left", "right")[self.mission_finger_ids.index(finger_id)]
@@ -601,7 +620,7 @@ class BulletROS:
             out.success = False
             return out
         if self.MAX_FORCE == -1:
-            request.force = 180
+            request.force = 100
 
         velocity = 0.5
 
@@ -616,8 +635,12 @@ class BulletROS:
 
         mission_block = None
         if closing and getattr(self.client.config, "rg6_hold_mission_block", False):
-            mission_block = next((obj_id for obj_id, name, _, _, _ in self.client.other_objects
-                                  if name == "mission_block"), None)
+            block_name = (rospy.get_param("~mission_active_block", "mission_block")
+                          if self.mission_blocks_pub is not None else "mission_block")
+            mission_block = self.mission_blocks.get(block_name)
+            if mission_block is None:
+                rospy.logerr("Unknown mission block: %s", block_name)
+                return gripResponse(success=False)
             if mission_block is not None:
                 self.client.setJointMotorControl2(
                     self.client.robot, self.client.gripper.finger_joint_id,

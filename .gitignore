@@ -7,5 +7,6 @@ devel*
 logs*
 src/airskin-pain*
 *_build*
+tuts/*.bag
 
 rg6*

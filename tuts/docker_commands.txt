@@ -10,6 +10,13 @@ docker exec pyur kill -KILL 1234
 ## to launch the simulator
 roslaunch bullet_ros_ur simulation.launch sim_config:=ros_mission_approach.yaml rviz:=true
 
+
+## run MPC client
+python tests/run_pyur_reach.py --place --ignore-slip
+
+## run pyur side (in Docker)
+python3 /home/docker/data/tuts/pyur_mpc_bridge.py --place
+
 ## Test on localhost
 source /opt/ros/noetic/setup.bash
 source /home/docker/data/devel/setup.bash

@@ -11,7 +11,7 @@ import rosnode
 import rospy
 from controller_manager_msgs.srv import SwitchController, SwitchControllerRequest
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float32, Float64MultiArray
+from std_msgs.msg import Float32, Float64MultiArray, String
 
 
 POSITION = "scaled_pos_joint_traj_controller"
@@ -19,6 +19,8 @@ VELOCITY = "joint_group_vel_controller"
 SWITCH = "/robot/controller_manager/switch_controller"
 MAX_SPEED = 0.05
 WATCHDOG = 0.75
+TWO_BLOCK_NAMES = ("mission_block", "mission_block_blue")
+TWO_BLOCK_OPEN_WIDTH = 75.0
 
 
 def switch_controller(service, start, stop):
@@ -31,14 +33,16 @@ def switch_controller(service, start, stop):
 
 
 def exchange(connection, latest_state, joints, publisher, approach_feedback=None, close_gripper=None, *,
-             carry=False, open_gripper=None):
+             carry=False, open_gripper=None, select_block=None):
     last_command = [0.0] * len(joints)
     time_limit = 480.0 if open_gripper else 240.0 if carry else 120.0 if approach_feedback else 30.0
+    if select_block:
+        time_limit *= 2
     deadline = time.monotonic() + time_limit
     connection.settimeout(WATCHDOG)
     closed = False
     with connection.makefile("rb") as stream:
-        for seq in range(5200 if open_gripper else 2600 if carry else 1000):
+        for seq in range(10400 if select_block else 5200 if open_gripper else 2600 if carry else 1000):
             if rospy.is_shutdown() or time.monotonic() >= deadline:
                 break
             state = latest_state()
@@ -62,6 +66,13 @@ def exchange(connection, latest_state, joints, publisher, approach_feedback=None
                 break
             if time.monotonic() >= deadline or rospy.is_shutdown():
                 break
+            if "select_block" in reply:
+                if select_block is None or closed:
+                    raise ValueError("Block selection requires an open gripper in two-block mode")
+                last_command = [0.0] * len(joints)
+                publisher.publish(Float64MultiArray(data=last_command))
+                select_block(reply["select_block"])
+                continue
             if reply.get("close_gripper") is True:
                 if close_gripper is None or closed:
                     raise ValueError("Unexpected gripper close request")
@@ -91,7 +102,7 @@ def exchange(connection, latest_state, joints, publisher, approach_feedback=None
             last_command = command
 
 
-def make_approach_feedback(pick=False, place=False):
+def make_approach_feedback(pick=False, place=False, active_block=None):
     import tf2_ros
     from bullet_ros_ur.msg import Collisions
     from geometry_msgs.msg import PoseArray
@@ -101,6 +112,7 @@ def make_approach_feedback(pick=False, place=False):
     buffer = tf2_ros.Buffer()
     listener = None if pick else tf2_ros.TransformListener(buffer)
     block = None
+    blocks = None
     contacts = None
     finger_poses = None
 
@@ -112,12 +124,19 @@ def make_approach_feedback(pick=False, place=False):
                 block = ([p.x, p.y, p.z], time.monotonic())
                 return
 
-    subscriber = rospy.Subscriber("/other_objects", MarkerArray, capture, queue_size=1)
+    def capture_blocks(message):
+        nonlocal blocks
+        blocks = (json.loads(message.data), time.monotonic())
+
+    if active_block:
+        subscriber = rospy.Subscriber("/bullet_ros/mission_blocks", String, capture_blocks, queue_size=1)
+    else:
+        subscriber = rospy.Subscriber("/other_objects", MarkerArray, capture, queue_size=1)
     contact_subscriber = None
     finger_subscriber = None
     support_subscriber = None
     destination_load = None
-    if place:
+    if place and not active_block:
         def capture_support(message):
             nonlocal destination_load
             if math.isfinite(message.data):
@@ -130,8 +149,9 @@ def make_approach_feedback(pick=False, place=False):
             nonlocal contacts
             forces = {}
             for name, link, force in zip(message.obj_names, message.robot_links, message.forces):
-                if name == "mission_block" and math.isfinite(force) and force > 0:
-                    forces[link] = forces.get(link, 0.0) + force
+                if math.isfinite(force) and force > 0:
+                    key = (name, link)
+                    forces[key] = forces.get(key, 0.0) + force
             contacts = (forces, time.monotonic())
 
         contact_subscriber = rospy.Subscriber("/bullet_ros/collisions", Collisions,
@@ -149,7 +169,9 @@ def make_approach_feedback(pick=False, place=False):
         frames = ("left_inner_finger", "right_inner_finger")
         if pick:
             deadline = time.monotonic() + timeout
-            while finger_poses is None and time.monotonic() < deadline and not rospy.is_shutdown():
+            while (finger_poses is None or (active_block and blocks is None)) and (
+                time.monotonic() < deadline and not rospy.is_shutdown()
+            ):
                 time.sleep(0.01)
             sample = finger_poses
             if sample is None or time.monotonic() - sample[1] > 0.25:
@@ -165,9 +187,10 @@ def make_approach_feedback(pick=False, place=False):
             transforms = [buffer.lookup_transform("base_link", frame, stamp, rospy.Duration(0.2)).transform
                           for frame in frames]
             poses = [(transform.translation, transform.rotation) for transform in transforms]
-        sample = block
+        block_name = active_block() if active_block else "mission_block"
+        sample = blocks if active_block else block
         if sample is None or time.monotonic() - sample[1] > 0.25:
-            raise RuntimeError("No fresh mission block marker. Launch ros_mission_approach.yaml.")
+            raise RuntimeError("No fresh mission block feedback. Check the simulator scene.")
         fingers = []
         pads = []
         for p, r in poses:
@@ -181,11 +204,23 @@ def make_approach_feedback(pick=False, place=False):
         if not pick and opening < 0.065:
             raise RuntimeError(f"Simulated RG6 finger-frame separation too small: {opening * 1000:.1f} mm")
         center = [(left + right) / 2 for left, right in zip(*fingers)]
-        result = {"grasp_center_base_link": center, "block_center_base_link": sample[0]}
+        if active_block:
+            block_states = sample[0]
+            result = {
+                "active_block": block_name,
+                "blocks": block_states,
+                "block_center_base_link": block_states[block_name]["position"],
+                "destination_load": block_states[block_name]["destination_load"],
+            }
+        else:
+            result = {"block_center_base_link": sample[0]}
+        result["grasp_center_base_link"] = center
         if pick:
             contact_sample = contacts
-            forces = (contact_sample[0] if contact_sample is not None
-                      and time.monotonic() - contact_sample[1] <= 0.25 else {})
+            forces = {}
+            if contact_sample is not None and time.monotonic() - contact_sample[1] <= 0.25:
+                forces = {link: force for (name, link), force in contact_sample[0].items()
+                          if name == block_name}
             per_jaw = [forces.get(frame, 0.0) for frame in frames]
             result.update(
                 pad_center_base_link=[(left + right) / 2 for left, right in zip(*pads)],
@@ -194,7 +229,7 @@ def make_approach_feedback(pick=False, place=False):
                 per_jaw_force=per_jaw,
                 bilateral_contact=min(per_jaw) >= 0.1,
             )
-        if place:
+        if place and not active_block:
             load = destination_load
             if load is None or time.monotonic() - load[1] > 0.25:
                 raise RuntimeError("No fresh destination load. Restart the mission simulator.")
@@ -215,7 +250,9 @@ def main():
     mode.add_argument("--pick", action="store_true", help="Allow one RG6 close during PickLift")
     mode.add_argument("--carry", action="store_true", help="Allow a continuous PickLift and carry session")
     mode.add_argument("--place", action="store_true", help="Allow pick, carry, and a supported release")
+    mode.add_argument("--two-block", action="store_true", help="Allow two identified block transfers")
     args = parser.parse_args()
+    args.place = args.place or args.two_block
     if not 0 < args.grip_force <= 180.0:
         parser.error("--grip-force must be greater than 0 and at most 180")
 
@@ -242,23 +279,36 @@ def main():
     approach_feedback = None
     close_gripper = None
     open_gripper = None
+    select_block = None
+    active_block = TWO_BLOCK_NAMES[0]
+    if args.two_block:
+        def select_block(name):
+            nonlocal active_block
+            if name not in TWO_BLOCK_NAMES:
+                raise ValueError(f"Unknown two-block target: {name!r}")
+            active_block = name
     if args.approach or args.pick or args.carry or args.place:
         from bullet_ros_ur.srv import grip
 
-        approach_feedback, approach_subscriptions = make_approach_feedback(not args.approach, args.place)
+        approach_feedback, approach_subscriptions = make_approach_feedback(
+            not args.approach, args.place, (lambda: active_block) if args.two_block else None
+        )
         grip_service = "/robot/ur_hardware_interface/grip"
         rospy.wait_for_service(grip_service, timeout=5)
         gripper = rospy.ServiceProxy(grip_service, grip)
+        open_width = TWO_BLOCK_OPEN_WIDTH if args.two_block else 150.0
         if args.approach or args.place:
-            if not gripper(150.0, 100.0).success:
+            if not gripper(open_width, 100.0).success:
                 raise RuntimeError("Could not open the simulated RG6 gripper")
         if not args.approach:
             def close_gripper():
+                if args.two_block:
+                    rospy.set_param("/pyUR/mission_active_block", active_block)
                 rospy.loginfo("Closing simulated RG6 with force setting %.1f", args.grip_force)
                 return gripper(0.0, args.grip_force)
             if args.place:
                 def open_gripper():
-                    return gripper(150.0, 100.0)
+                    return gripper(open_width, 100.0)
     publisher = rospy.Publisher("/joint_group_vel_controller/command", Float64MultiArray,
                                 queue_size=1)
     service = rospy.ServiceProxy(SWITCH, SwitchController)
@@ -288,7 +338,8 @@ def main():
                         raise RuntimeError("PyUR joint feedback or velocity controller unavailable")
                     time.sleep(0.01)
                 exchange(connection, lambda: state, joints, publisher, approach_feedback,
-                         close_gripper, carry=args.carry or args.place, open_gripper=open_gripper)
+                         close_gripper, carry=args.carry or args.place, open_gripper=open_gripper,
+                         select_block=select_block)
             finally:
                 try:
                     publisher.publish(Float64MultiArray(data=[0.0] * len(joints)))

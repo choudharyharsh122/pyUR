@@ -319,7 +319,13 @@ class pyUR(BulletClient):
             for urdf_id, urdf, pos, color, fixed in zip(range(len(self.config.urdfs.paths)), self.config.urdfs.paths, self.config.urdfs.positions, self.config.urdfs.color, self.config.urdfs.fixed):
                 obj_name = os.path.basename(urdf).split(".")[0]
                 urdf = self.urdfs[obj_name].path
-                self.other_objects.append((self.loadURDF(urdf, pos, useFixedBase=fixed), obj_name, fixed, color, urdf.split("other_meshes/")[1].replace(".urdf", ".obj")))
+                body_id = self.loadURDF(urdf, pos, useFixedBase=fixed)
+                if hasattr(self.config.urdfs, "names"):
+                    name = self.config.urdfs.names[urdf_id]
+                    self.urdfs[name] = self.urdfs[obj_name]
+                    obj_name = name
+                    self.changeVisualShape(body_id, -1, rgbaColor=color)
+                self.other_objects.append((body_id, obj_name, fixed, color, urdf.split("other_meshes/")[1].replace(".urdf", ".obj")))
 
                 if not fixed:
                     self.free_objects.append(self.other_objects[-1][0])
